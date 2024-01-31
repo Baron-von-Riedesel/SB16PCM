@@ -293,7 +293,6 @@ ScanBlasterVar endp
 getfileinfo proc stdcall pszFile:ptr
 
 local hFile:dword
-local currdevice:dword
 local riffhdr:RIFFHDR
 local datahdr:RIFFCHKHDR
 

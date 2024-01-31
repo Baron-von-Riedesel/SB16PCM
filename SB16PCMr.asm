@@ -20,6 +20,8 @@ DMAHIGH 	EQU 5		; HDMA channel
 
 USELOWDMAFOR8BIT equ 1	; 0 works for VSB only
 
+BIOSTIMER equ 46Ch	; BIOS data address of current PIT value
+
 lf equ 10
 
 	include dma.inc
@@ -219,13 +221,15 @@ found:
 	ret
 GetEnvironmentVariable endp
 
-;--- si:ptr
+;--- convert string to number
+;--- si:text ptr
 ;--- al:first digit
 ;--- cl:base (10/16)
 ;--- out:number in AX
+;---     si -> behind number
 ;--- Z if no valid digit found
 
-getnum proc uses ebx
+getnum proc uses bx
 	mov bx, si
 	xor edx, edx
 	movzx ecx, cl
@@ -300,7 +304,6 @@ ScanBlasterVar endp
 getfileinfo proc stdcall pszFile:ptr
 
 local hFile:word
-local currdevice:dword
 local riffhdr:RIFFHDR
 local datahdr:RIFFCHKHDR
 
@@ -534,18 +537,15 @@ GetDmaChannel endp
 
 ;--- get linear address and offset of sample buffer.
 ;--- (must not cross a 64-kB boundary)
+;--- linear address (=dwSampleBuffer) is used for DMAcontroller page & offset
+;--- offset address (=pSampleBuffer) is used for file reads
 
 getsamplebuffer proc uses esi
+
 	mov ax, ds
 	movzx eax,ax
 	shl eax, 4
-	mov ecx, offset samplebuffer
-	add eax, ecx
-
-;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; calculate page and offset for DMAcontroller :
-;
-;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+	add eax, offset samplebuffer
 
 	mov esi, eax
 	mov ecx, SAMPLEBUFFERLENGTH
@@ -553,14 +553,13 @@ getsamplebuffer proc uses esi
 	mov edx, esi
 	shr eax, 16
 	shr edx, 16
-	cmp eax, edx				;does a 64kb segment overrun occur?
+	cmp ax, dx				;does a 64kb segment overrun occur?
 	jz @F
-	shl eax, 16
 
-	mov edx, eax
-	sub edx, esi
-	add dx, offset samplebuffer
-	mov [pSampleBuffer], dx
+	shl eax, 16
+	mov edx, eax			;eax & edx = linear address of 64kb segment to use
+	sub edx, esi			;edx = difference to linear address of original sample buffer
+	add [pSampleBuffer], dx	;adjust offset
 
 	mov esi, eax
 @@:
@@ -568,6 +567,7 @@ getsamplebuffer proc uses esi
 	mov [dwSampleBuffer], eax
 	clc
 	ret
+
 getsamplebuffer endp
 
 ;--- return #samples in one half of sample buffer (ecx).
@@ -575,6 +575,7 @@ getsamplebuffer endp
 ;--- edx must be preserved.
 
 getsamplebufferlength proc
+
 	mov ecx, SAMPLEBUFFERLENGTH shr 1
 	cmp wavefmt.wBitsPerSample, 8
 	jz @F
@@ -657,6 +658,15 @@ ReadDSPWord proc stdcall bCmd:byte
 
 ReadDSPWord endp
 
+;--- get current PIT timer 0 value
+
+gettimer proc uses ds
+	mov ax, 0
+	mov ds, ax
+	mov eax, ds:[BIOSTIMER]
+	ret
+gettimer endp
+
 main proc c argc:word, argv:ptr
 
 local hFile:word
@@ -671,7 +681,7 @@ local szVar[64]:byte
 
 	.if argc < 2
 		invoke printf, CStr("%s",10), CStr('Play 8/16bit mono/stereo with cmd C6h/B6h (SB16 only).')
-		invoke printf, CStr("%s",10), CStr("Usage: playsb16 .WAV-filename")
+		invoke printf, CStr("%s",10), CStr("Usage: sb16pcmr .WAV-filename")
 		invoke printf, CStr("%s",10), CStr('Stop playing with <ESC>.')
 		jmp exit2
 	.endif
@@ -876,16 +886,12 @@ local szVar[64]:byte
 
 ; TRANSFER STARTS NOW
 
-	mov eax, ds:[46ch]
+	call gettimer
 	mov dwTimer, eax
 waitloop:
 if 1
 	.if bVerbose
-		push ds
-		mov ax, 0
-		mov ds, ax
-		mov eax, ds:[46ch]
-		pop ds
+		call gettimer
 		sub eax, dwTimer
 		cmp eax, 5
 		jb @F
