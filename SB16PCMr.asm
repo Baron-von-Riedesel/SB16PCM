@@ -92,8 +92,9 @@ SAMPLEBUFFERLENGTH equ 6000h
 	.DATA
 
 OldIntSB    dd 0
-dwDosAddr	dd 0   ; linear address sample buffer
+dwSampleBuffer dd 0   ; linear address sample buffer
 dwChunks	dd 0
+pSampleBuffer dw offset samplebuffer ; near ptr sample buffer
 wBase		dw BASEADDR
 wIrq		dw SBIRQ
 wDmaL		dw DMALOW
@@ -531,15 +532,15 @@ endif
 	ret
 GetDmaChannel endp
 
-;--- get sample buffer in DOS memory
+;--- get linear address and offset of sample buffer.
+;--- (must not cross a 64-kB boundary)
 
-getsamplebuffer proc uses si
+getsamplebuffer proc uses esi
 	mov ax, ds
 	movzx eax,ax
 	shl eax, 4
 	mov ecx, offset samplebuffer
 	add eax, ecx
-	mov dwDosAddr, eax
 
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
 ; calculate page and offset for DMAcontroller :
@@ -555,10 +556,16 @@ getsamplebuffer proc uses si
 	cmp eax, edx				;does a 64kb segment overrun occur?
 	jz @F
 	shl eax, 16
+
+	mov edx, eax
+	sub edx, esi
+	add dx, offset samplebuffer
+	mov [pSampleBuffer], dx
+
 	mov esi, eax
-;	add esi, ecx                ;then use second instance of data
 @@:
 	mov eax, esi
+	mov [dwSampleBuffer], eax
 	clc
 	ret
 getsamplebuffer endp
@@ -688,17 +695,17 @@ local szVar[64]:byte
 	mov hFile, bx
 	mov dwSize, eax
 
-;--- get sample buffer
+;--- calc linear address and offset of sample buffer
 
 	call getsamplebuffer
 	jc exit2
 	.if bVerbose
-		invoke printf, CStr("sample buffer linear address=%lX",10), dwDosAddr
+		invoke printf, CStr("sample buffer linear address=%lX",10), [dwSampleBuffer]
 	.endif
 
 ;--- fill sample buffer
 
-	mov si, offset samplebuffer
+	mov si, [pSampleBuffer]
 	invoke fileread, hFile, si, dwSize	; fill first half of buffer
 	jc exit
 	sub dwSize, eax
@@ -789,7 +796,7 @@ local szVar[64]:byte
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
 ; 4th  WRITE PAGE NUMBER
 ;
-	mov esi, [dwDosAddr]
+	mov esi, [dwSampleBuffer]
 	mov eax, esi
 	shr eax, 16
 	cmp wDmaBaseChn, 10h
@@ -900,14 +907,14 @@ endif
 	mov [bReady],0
 	cmp dwSize, 0
 	jz @F
-	invoke fileread, hFile, offset samplebuffer, dwSize
+	invoke fileread, hFile, pSampleBuffer, dwSize
 	jc exit
 	sub dwSize, eax
 	jmp waitloop
 @@:
 if 1
 ;--- wait till the last half has been played
-	invoke fileread, hFile, offset samplebuffer, dwSize
+	invoke fileread, hFile, pSampleBuffer, dwSize
 @@:
 	cmp [bReady],0
 	jz @B
