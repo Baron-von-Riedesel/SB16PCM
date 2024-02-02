@@ -256,7 +256,8 @@ exit:
 	ret
 getnum endp
 
-;--- scan BLASTER variable
+;--- scan BLASTER variable, overwrite
+;--- default values in wBase, wIrq, wDmaL, wDmaH, wType
 
 ScanBlasterVar proc stdcall uses si pVar:ptr
 	mov si, pVar
@@ -297,11 +298,11 @@ numdone:
 	ret
 ScanBlasterVar endp
 
-;--- open .wav file
-;--- check format
-;--- return handle in bx, size in eax
+;--- open .wav file, check file format
+;--- returns: NC: handle in bx, audio data size in eax
+;---           C: file open error or format unknown 
 
-getfileinfo proc stdcall pszFile:ptr
+getfileinfo proc stdcall uses si di pszFile:ptr
 
 local hFile:word
 local riffhdr:RIFFHDR
