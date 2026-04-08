@@ -30,7 +30,7 @@ ltoa PROC c uses ebx esi edi number:dword, tbuffer:ptr byte, base:dword
 	mov ch,'-'
 @@:
 	add ebx,10
-	mov BYTE PTR [ebx],0
+	mov BYTE PTR ss:[ebx],0
 	dec ebx
 @@nextdigit:
 	xor edx, edx
@@ -40,13 +40,13 @@ ltoa PROC c uses ebx esi edi number:dword, tbuffer:ptr byte, base:dword
 	jbe @F
 	add dl,7+20h
 @@:
-	mov [ebx],dl
+	mov ss:[ebx],dl
 	dec ebx
 	and eax, eax
 	jne @@nextdigit
 	cmp ch,0
 	je @F
-	mov [ebx],ch
+	mov ss:[ebx],ch
 	dec ebx
 @@:
 	inc ebx
@@ -72,7 +72,6 @@ nextchar:
 	je done
 	cmp al,'%'
 	je formatitem
-	push eax
 	call handle_char
 	jmp nextchar
 done:
@@ -133,15 +132,14 @@ formatitem:
 	pop eax
 	jmp done
 handle_c:
-	mov eax,[edi]
+	mov eax,ss:[edi]
 	add edi, 4
 @@:
-	push eax
 	call handle_char
 	retn
 
 handle_s:
-	mov esi,[edi]
+	mov esi,ss:[edi]
 	add edi,4
 	jmp print_string
 handle_d:
@@ -154,7 +152,7 @@ handle_u:
 handle_x:
 	mov ebx, 16
 @@:
-	mov eax,[edi]
+	mov eax,ss:[edi]
 	add edi,4
 	cmp [longarg],0
 	jne @F
@@ -162,7 +160,13 @@ handle_x:
 @@:
 	lea esi, szTmp
 	invoke ltoa, eax, esi, ebx
+	push ds
+	push ss
+	pop ds
 	mov esi, eax
+	call print_string
+	pop ds
+	retn
 
 print_string:		;print string ESI, size EAX
 	mov eax, esi
@@ -175,7 +179,7 @@ print_string:		;print string ESI, size EAX
 	sub ebx,eax
 	.if flag == 1
 		.while sdword ptr ebx > 0
-			push [fillchr]
+			mov eax,[fillchr]
 			call handle_char	;print leading filler chars
 			dec ebx
 		.endw
@@ -183,30 +187,36 @@ print_string:		;print string ESI, size EAX
 
 	.while byte ptr [esi]
 		lodsb
-		push eax
 		call handle_char	;print char of string
 	.endw
 
 	.while sdword ptr ebx > 0
-		push [fillchr]
+		mov eax, [fillchr]
 		call handle_char	;print trailing spaces
 		dec ebx
 	.endw
 	retn
 
 handle_char:
-	pop ecx
-	pop edx
+	mov edx, eax
 	cmp dl,10
 	jnz @F
 	mov dl,13
-	mov ah,2
-	int 21h
+	call @F
 	mov dl,10
 @@:
+if ASYNCDMASTAT		; printf called during interrupt time?
+	push ebx
+	xor ebx, ebx
+	mov al, dl
+	mov ah,0Eh
+	int 10h
+	pop ebx
+else
 	mov ah,2
 	int 21h
-	jmp ecx
+endif
+	retn
 
 	align 4
 

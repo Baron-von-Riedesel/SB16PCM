@@ -1,6 +1,8 @@
 
 ;--- simple printf() implementation
 
+ASYNCDISPSTAT equ 0
+
 handle_char proc
 
 	mov dl,al
@@ -10,8 +12,17 @@ handle_char proc
 	call @F
 	mov dl,10
 @@:
+if ASYNCDISPSTAT
+	push bx
+	xor bx, bx
+	mov ah, 0Eh
+	mov al, dl
+	int 10h
+	pop bx
+else
 	mov ah,2
 	int 21h
+endif
 	ret
 
 handle_char endp

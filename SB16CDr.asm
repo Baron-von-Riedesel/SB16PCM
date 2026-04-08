@@ -1,11 +1,6 @@
 
-;--- Play with Cxh/Bxh commands on SoundBlaster 16/16ASP.
+;--- Play CD Audio with Cxh/Bxh commands on SoundBlaster 16/16ASP.
 ;--- Public Domain, written by Andreas Grech.
-;--- Inspired by a demo of Andr‚ Baresel.
-
-;--- This is the source for the real-mode variants. The
-;--- first uses DOS conventional memory as PCM buffer, the
-;--- second uses the VDS DMA buffer ( useful as a test program ).
 
 	.286
 	.MODEL small
@@ -15,23 +10,57 @@
 	option proc:private
 	.386
 
-ifndef USEVDS
-USEVDS equ 0
-endif
-
 ;--- defaults ( overwritten by BLASTER environment variable )
 BASEADDR	EQU 220h	; base address
-SBIRQ		EQU 7		; IRQ
+SBIRQ		EQU 5		; IRQ
 DMALOW		EQU 1		; DMA channel
 DMAHIGH 	EQU 5		; HDMA channel
 
-USELOWDMAFOR8BIT equ 1	; 0 works for VSB only
+;--- CD-ROM access
 
-if USEVDS
-PGMNAME textequ <"sb16pcmv">
-else
-PGMNAME textequ <"sb16pcmr">
-endif
+IOCREAD  equ 03h     ;ioctl read cmd
+READLONG equ 80h     ;real long cmd
+
+IO_VOLSIZE   equ 8   ;ioctl get volume size
+IO_DISKINFO  equ 10  ;ioctl get disk info
+IO_TRKINFO   equ 11  ;ioctl get track info
+
+HSG_MODE equ 00h
+RB_MODE  equ 01h
+
+COOKED   equ 00h
+RAW      equ 01h
+
+reqhdr  struct
+len     db ?
+subunit db ?
+cmd     db ?
+status  dw ?
+res1    dd ?
+res2    dd ?
+reqhdr  ends
+
+cmd03   struct      ;read ioctl
+        reqhdr <>
+mdesc   DB   ?      ; block devices: Media descriptor byte from BPB
+taddr   DD   ?      ; Transfer address
+numbyt  DW   ?      ; call: # bytes to transfer; return: # bytes transfered
+cmd03   ends
+
+cmd80   struct
+        reqhdr <>
+mode    db ?         ;addressing mode (0=HSG,1=red book)
+address dd ?         ;transfer address
+numsecs dw ?         ;number of sectors to read
+stasecs dd ?         ;start of sectors to read
+readmod db ?         ;00=cooked (2048),01=raw (2356)
+intsize db ?         ;interleave
+intskip db ?         ;interleave
+cmd80   ends
+
+;----------------------
+
+PGMNAME textequ <"SB16CDr">
 
 BIOSTIMER equ 46Ch	; BIOS data address of current PIT value
 
@@ -39,9 +68,6 @@ lf equ 10
 
 	include dma.inc
 	include sbequ.inc
-if USEVDS
-	include vds.inc
-endif
 
 ; DMA WRITE MODE
 WANTEDMODE  EQU DMA_MODE_SINGLE + DMA_MODE_AUTOINIT + DMA_MODE_READ
@@ -84,34 +110,12 @@ WriteDSP macro Base, cmd
 	out dx, al
 endm
 
-RIFFHDR struct
-chkId   dd ?
-chkSiz  dd ?
-format  dd ?
-RIFFHDR ends
+?SECSIZE equ 2352
 
-RIFFCHKHDR struct
-subchkId    dd ?
-subchkSiz   dd ?
-RIFFCHKHDR ends
+SAMPLEBUFFERLENGTH equ ?SECSIZE*4
 
-WAVEFMT struct
-        RIFFCHKHDR <>
-wFormatTag      dw ?
-nChannels       dw ?
-nSamplesPerSec  dd ?
-nAvgBytesPerSec dd ?
-nBlockAlign     dw ?
-wBitsPerSample  dw ?
-WAVEFMT ends
+	.data
 
-SAMPLEBUFFERLENGTH equ 6000h
-
-	.DATA
-
-if USEVDS
-dds DDS <0,0,0,0>
-endif
 OldIntSB    dd 0
 dwSampleBuffer dd 0   ; linear address sample buffer
 dwChunks	dd 0
@@ -121,31 +125,47 @@ wIrq		dw SBIRQ
 wDmaL		dw DMALOW
 wDmaH		dw DMAHIGH
 wType		dw 0
-bVerbose    db 1
-bReady      db 0
-bOldMask	db 0
+wOldMask	dw 0
+
+bInit		db 0
+bVerbose	db 1
+bHelp		db 0
+bReady		db 0
+
 	align word
+
 wDmaBaseChn dw 0
 wDmaCntChn  dw 0
 wDmaPageChn dw 0
 wDmaWriteMask dw 0
 wDmaWriteMode dw 0
 wDmaClearFlipFlop dw 0
+wDrive dw 0
+wBitsPerSample dw 16
+nSamplesPerSec dd 44100
 
-wavefmt WAVEFMT <>
+req03   cmd03  <>	;ioctl
+req80   cmd80  <>	;read long
 
 	.data?
 
-if USEVDS
-samplebuffer db SAMPLEBUFFERLENGTH dup (?)
-else
 samplebuffer db SAMPLEBUFFERLENGTH * 2 dup (?)
-endif
+
 	.const
 
 pgtab db 87h, 83h, 81h, 82h, -1, 8bh, 89h, 8ah
 
-	.CODE
+szHelp label byte
+	db PGMNAME," - read Audio CD data and send it to the SB16.",lf
+	db "Usage: ",PGMNAME," [options] [track#]",lf
+	db " options:",lf
+	db " -? : this help",lf
+	db " -q : be quiet",lf
+	db "If track# is omitted, all tracks are rendered.",lf
+	db "Stop playing with <ESC>.",lf
+	db 0
+
+	.code
 
 dsseg dw 0
 
@@ -244,10 +264,9 @@ found:
 GetEnvironmentVariable endp
 
 ;--- convert string to number
-;--- si:text ptr
-;--- al:first digit
+;--- si:src text
 ;--- cl:base (10/16)
-;--- out:number in AX
+;--- out:number in EAX
 ;---     si -> behind number
 ;--- Z if no valid digit found
 
@@ -320,181 +339,190 @@ numdone:
 	ret
 ScanBlasterVar endp
 
-;--- open .wav file, check file format
-;--- returns: NC: handle in bx, audio data size in eax
-;---           C: file open error or format unknown 
+;--- send device driver request
 
-getfileinfo proc stdcall uses si di pszFile:ptr
+SendReq proc stdcall req:ptr BYTE
 
-local hFile:word
-local riffhdr:RIFFHDR
-local datahdr:RIFFCHKHDR
+	mov bx,req
+	push ds
+	pop es
+	mov cx,wDrive
+	clc 			;XP needs this
+	mov ax,1510h	;send dev. req.
+	int 2Fh
+	ret
 
-	mov hFile,-1
+SendReq endp
 
-;--- open the .wav file
+;--- check CD.
+;--- returns: NC: ok
+;---           C: no audio CD
 
-	mov si, pszFile
-	mov bx,3040h
-	mov cx,0
-	mov dx,1
-	mov di,0
-	mov ax,716Ch
-	stc
-	int 21h
-	jnc @F
-	.if ax == 7100h
-		mov ax,6c00h
-		int 21h
-	.endif
-	.if CARRY?
-		invoke printf, CStr("cannot open '%s'",lf), si
-		jmp exit
-	.endif
-@@:
-	mov bx, ax
-	mov hFile, ax
+ioctl08 struct	;get volume size
+cmd     db ?
+sectors dd ?	;size in sectors
+ioctl08 ends
 
-;--- now load the RIFF headers to get the PCM format and size for the samples block
+getvolsize proc
 
-	lea dx,riffhdr
-	mov cx,sizeof riffhdr
-	mov ax,3F00h
-	int 21h
-	.if ax != cx
-		invoke printf, CStr("file %s: cannot read riff header",lf), si
-		jmp exit
-	.endif
-	.if (riffhdr.chkId != "FFIR")
-		invoke printf, CStr("file %s: no RIFF header found",lf), si
-		jmp exit
-	.endif
-	.if (riffhdr.format != "EVAW")
-		invoke printf, CStr("file %s: not a WAVE format",lf), si
-		jmp exit
-	.endif
-	mov dx, offset wavefmt
-	mov cx, sizeof wavefmt
-	mov ax,3F00h
-	int 21h
-	.if ax != cx
-		invoke printf, CStr("file %s: cannot read wave format",lf), si
-		jmp exit
-	.endif
-	.if (wavefmt.subchkId != " tmf")
-		invoke printf, CStr("file %s: no fmt chunk found",lf), si
-		jmp exit
-	.endif
+local ctl08:ioctl08
+
+;--- get volume size
+	mov req03.len, sizeof cmd03
+	mov req03.cmd, IOCREAD
+	lea ax, ctl08
+	mov word ptr req03.taddr+0, ax
+	mov word ptr req03.taddr+2, ss
+	mov req03.numbyt, sizeof ioctl08
+	mov ctl08.cmd, IO_VOLSIZE	;get volume size
+	mov ctl08.sectors, 0
+	invoke SendReq, addr req03
+	jc error
+	test req03.status, 8000h
+	jnz error
 	.if bVerbose
-		invoke printf, CStr("Channels=%u",lf), wavefmt.nChannels
-		invoke printf, CStr("Samples/Second=%u",lf), wavefmt.nSamplesPerSec
-		invoke printf, CStr("Bits/Sample=%u",lf), wavefmt.wBitsPerSample
+		invoke printf, CStr("IOCTL volume size: [%X] sectors=%lu",lf), req03.status, ctl08.sectors
 	.endif
-
-	lea dx, datahdr
-	mov cx, sizeof datahdr
-	mov ax, 3F00h
-	int 21h
-	.if ax != cx
-		invoke printf, CStr("file %s: cannot read data header",lf), si
-		jmp exit
-	.endif
-	.if (datahdr.subchkId != "atad")
-		invoke printf, CStr("file %s: no data chunk found",lf), si
-		jmp exit
-	.endif
-	.if bVerbose
-		invoke printf, CStr("data subchunk size=%lu",lf), datahdr.subchkSiz
-	.endif
-
-;--- format must be 8/16 bit, 1/2 channels, 11025/22050/44100 Hz
-	mov dx, wavefmt.wBitsPerSample
-	mov bx, wavefmt.nChannels
-	cmp dx, 16
-	jz @F
-	cmp dx, 8
-	jnz fmterr
-@@:
-	cmp bx, 1
-	jz @F
-	cmp bx, 2
-	jnz fmterr
-@@:
-	mov ecx, wavefmt.nSamplesPerSec
-	cmp ecx, 44100
-	jz @F
-	cmp ecx, 22050
-	jz @F
-	cmp ecx, 11025
-	jz @F
-fmterr:
-	invoke printf, CStr("formats supported: 8/16 bit, 1/2 channels, 11025/22050/44100 Hz",lf)
-	jmp exit
-@@:
-	mov bx, hFile
-	mov eax, datahdr.subchkSiz
+	mov eax, ctl08.sectors
 	clc
 	ret
-exit:
-	mov bx, hFile
-	cmp bx, -1
-	jz @F
-	mov ah, 3Eh
-	int 21h
-@@:
+error:
+	invoke printf, CStr("IOCTL volume size: failed [%X]",lf), req03.status
+	mov eax, -1
+	clc
+	ret
+
+getvolsize endp
+
+ioctl10 struct	;audio disk info
+cmd     db ?
+first   db ?
+last    db ?
+union
+leadout dd ?
+struct
+leadout_f db ?
+leadout_s db ?
+leadout_m db ?
+ends
+ends
+ioctl10 ends
+
+getdiskinfo proc
+
+local ctl10:ioctl10
+
+	mov req03.len, sizeof cmd03
+	mov req03.cmd, IOCREAD
+	lea ax, ctl10
+	mov word ptr req03.taddr+0, ax
+	mov word ptr req03.taddr+2, ss
+	mov req03.numbyt, sizeof ioctl10
+	mov ctl10.cmd, IO_DISKINFO
+	invoke SendReq, addr req03
+	jc error
+	test req03.status, 8000h
+	jnz error
+	.if bVerbose
+		invoke printf, CStr("IOCTL disk info: [%X] tracks=%u-%u, leadout=%02u:%02u:%02u",lf),
+			req03.status, ctl10.first, ctl10.last, ctl10.leadout_m, ctl10.leadout_s, ctl10.leadout_f
+	.endif
+	mov al, ctl10.first
+	mov ah, ctl10.last
+	clc
+	ret
+error:
+	invoke printf, CStr("IOCTL disk info: failed [%X]",lf), req03.status
 	stc
 	ret
-getfileinfo endp
 
-;--- read file
+getdiskinfo endp
+
+ioctl11 struct	;audio track info
+cmd     db ?
+track   db ?
+union
+start   dd ?
+struct
+start_f db ?
+start_s db ?
+start_m db ?
+ends
+ends
+ctlinfo db ?    ; bit 6=1 -> data track
+ioctl11 ends
+
+gettrackinfo proc stdcall track:word
+
+local ctl11:ioctl11
+
+	mov req03.len, sizeof cmd03
+	mov req03.cmd, IOCREAD
+	lea ax, ctl11
+	mov word ptr req03.taddr+0, ax
+	mov word ptr req03.taddr+2, ss
+	mov req03.numbyt, sizeof ioctl11
+	mov ctl11.cmd, IO_TRKINFO
+	mov ax, track
+	mov ctl11.track, al
+	invoke SendReq, addr req03
+	jc error
+	test req03.status, 8000h
+	jnz error
+	test ctl11.ctlinfo, 40h
+	jnz error2
+	mov eax, ctl11.start
+	call CvtLBA   ; convert RedBook in EAX to LBA
+	.if bVerbose
+		push eax
+		mov ecx, eax
+		invoke printf, CStr("IOCTL track info(%u): [%X] start=%lu (RedBook=%02u:%02u:%02u)",lf),
+        	track, req03.status, ecx, ctl11.start_m, ctl11.start_s, ctl11.start_f
+		pop eax
+	.endif
+	ret
+error:
+	invoke printf, CStr("IOCTL track info(%u): failed [%X]",lf), track, req03.status
+	stc
+	ret
+error2:
+	invoke printf, CStr("IOCTL track info(%u): [%X] data track",lf), track, req03.status
+	stc
+	ret
+gettrackinfo endp
+
+;--- read CD
 ;--- out: NC: read ok, eax=bytes read
 
-fileread proc stdcall hFile:word, pBuffer:ptr, dwSize:dword
+cdread proc stdcall pBuffer:ptr
+
 	mov dx, pBuffer
 	test dwChunks, 1
 	jz @F
 	add dx, SAMPLEBUFFERLENGTH shr 1
 @@:
-	xor eax, eax
-	mov ecx, dwSize
-	jecxz nothingtoread
-	cmp ecx, SAMPLEBUFFERLENGTH shr 1
-	jb @F
-	mov ecx, SAMPLEBUFFERLENGTH shr 1
-@@:
-	mov bx, hFile
-	mov ah, 3Fh
-	int 21h
+	mov req80.len,sizeof cmd80
+	mov req80.subunit,00
+	mov req80.cmd,READLONG
+	mov req80.mode,HSG_MODE
+	mov word ptr req80.address+0, dx
+	mov word ptr req80.address+2, ds
+	mov word ptr req80.numsecs+0, (SAMPLEBUFFERLENGTH shr 1) / ?SECSIZE
+	mov word ptr req80.readmod, RAW
+
+	invoke SendReq, addr req80
 	jc error
-if 0
-	pushad
-	invoke printf, CStr("fileread: read %u bytes",10), ax
-	popad
-endif
-nothingtoread:
-	cmp ax, SAMPLEBUFFERLENGTH shr 1
-	jz done
-	pushad
-	mov cx, SAMPLEBUFFERLENGTH shr 1
-	sub cx, ax
-	mov di, dx
-	add di, ax
-	mov al,0
-	cmp wavefmt.wBitsPerSample, 8
-	jnz @F
-	mov al,80h
-@@:
-	rep stosb
-	popad
-done:
+	test req80.status, 8000h
+	jnz error
+	add req80.stasecs, (SAMPLEBUFFERLENGTH shr 1) / ?SECSIZE
 	inc dwChunks
 	movzx eax, ax
 	ret
 error:
-	invoke printf, CStr("file read error",10)
+	invoke printf, CStr("Read long(%lu): failed [%X]",lf), req80.stasecs, req80.status
 	stc
 	ret
-fileread endp
+cdread endp
 
 ;--- set DMA registers
 ;--- WRITEMASK      DMABase + 10 * DMAWidth
@@ -507,12 +535,6 @@ fileread endp
 setdmaports proc uses ebx
 
 	movzx ebx, wDmaH
-if USELOWDMAFOR8BIT
-	cmp wavefmt.wBitsPerSample, 16
-	jz @F
-	mov bx, wDmaL
-@@:
-endif
 	mov edx, 0	; edx=DMABase (0/C0)
 	mov ecx, 1	; ecx=DMAWidth (1/2)
 	cmp ebx, 4
@@ -549,12 +571,6 @@ setdmaports endp
 GetDmaChannel proc
 	mov al, byte ptr wDmaH
 	sub al, 4
-if USELOWDMAFOR8BIT
-	cmp wavefmt.wBitsPerSample, 16
-	jz @F
-	mov al, byte ptr wDmaL
-@@:
-endif
 	ret
 GetDmaChannel endp
 
@@ -570,7 +586,6 @@ getsamplebufferaddr proc uses esi
 	shl eax, 4
 	add eax, offset samplebuffer
 
-ife USEVDS
 	mov esi, eax
 	mov ecx, SAMPLEBUFFERLENGTH
 	lea eax, [esi+ecx-1]
@@ -588,7 +603,7 @@ ife USEVDS
 	mov esi, eax
 @@:
 	mov eax, esi
-endif
+
 	mov [dwSampleBuffer], eax
 	clc
 	ret
@@ -603,13 +618,11 @@ getsamplebufferaddr endp
 getsamplebufferlength proc
 
 	mov ecx, SAMPLEBUFFERLENGTH shr 1
-	cmp wavefmt.wBitsPerSample, 8
-	jz @F
 	shr ecx, 1
-@@:
 	ret
 getsamplebufferlength endp
 
+if 0
 dispdmastatus proc
 	xor ecx, ecx
 	mov dx, [wDmaCntChn]
@@ -641,6 +654,7 @@ dispdmastatus proc
 	invoke printf, CStr("DMA ofs=%lX cnt=%lX stat=%X   ",13), eax, ecx, dx
 	ret
 dispdmastatus endp
+endif
 
 ResetDSP proc
 	mov dx, [wBase]
@@ -691,6 +705,36 @@ ReadDSPWord proc stdcall bCmd:byte
 
 ReadDSPWord endp
 
+;--- convert redbook address in EAX to LBA
+
+CvtLBA proc
+	mov cx,ax		;Save "seconds" & "frames" in CX-reg.
+	shr eax,16		;"minute" value to AX
+	cmp ax,99		;Is "minute" value too large?
+	ja error
+	cmp ch,60		;Is "second" value too large?
+	ja error
+	cmp cl,75		;Is "frame" value too large?
+	ja error
+
+;--- convert minute value to seconds
+	mov edx,60
+	mul dl
+	mov dl,ch		;add "second" value.
+	add ax,dx		;now ax contains seconds
+
+;--- convert seconds to frames
+	mov dl,75
+	mul edx
+	mov dl,150		;add "frame" value by subtracting it from "2 sec" offset
+	sub dl,cl
+	sub eax,edx
+	ret
+error:
+	mov eax,100*60*75	;error, set value to max (450.000)
+	ret
+CvtLBA endp
+
 ;--- get current PIT timer 0 value
 
 gettimer proc uses ds
@@ -700,116 +744,35 @@ gettimer proc uses ds
 	ret
 gettimer endp
 
-main proc c argc:word, argv:ptr
+;--- init SB hardware, including ISA DMA
 
-local hFile:word
-local dwSize:dword
-local dwTimer:dword
-local szVar[64]:byte
+InitSB proc
 
-	mov cs:[dsseg], ds
-	push ds
-	pop es
-	mov hFile, -1
+	cmp bInit, 1
+	jz exit    
 
-	.if argc < 2
-disphelp:
-		invoke printf, CStr("%s",10,"%s",10,"%s",10,"%s",10), 
-			CStr('Play 8/16bit mono/stereo with cmd C6h/B6h (SB16 only).'),
-			CStr("Usage: ",PGMNAME," [/q] .WAV-filename"),
-			CStr(" /q: don't display additional info."),
-			CStr('Stop playing with <ESC>.')
-		jmp exit2
-	.endif
+;--- init SB and DMA hardware
 
-;--- get BLASTER settings
-
-	invoke GetEnvironmentVariable, CStr("BLASTER"), addr szVar, sizeof szVar
-	.if (ax)
-		invoke ScanBlasterVar, addr szVar
-	.endif
-
-	mov bx, argv
-	mov bx, [bx+1*2]
-	mov ax,[bx]
-	.if al == '/' || al == '-'
-		or ah,20h
-		.if ah == 'q' && argc > 2
-			mov bVerbose, 0
-			mov bx, argv
-			mov bx, [bx+2*2]
-			jmp optok
-		.endif
-		jmp disphelp
-	.endif
-optok:
-
-;--- get file info
-
-	invoke getfileinfo, bx
-	jc exit2
-	mov hFile, bx
-	mov dwSize, eax
-
-	.if bVerbose
-		invoke printf, CStr("base=%X, irq=%u, dma=%u, hdma=%u",10), wBase, wIrq, wDmaL, wDmaH
-	.endif
-
-;--- set linear address (dwSampleBuffer) and offset (pSampleBuffer) of sample buffer
-
-	call getsamplebufferaddr
-	jc exit2
-	.if bVerbose
-		invoke printf, CStr("sample buffer linear address=%lX",10), [dwSampleBuffer]
-	.endif
-
-;--- fill sample buffer
-
-	mov si, [pSampleBuffer]
-	invoke fileread, hFile, si, dwSize	; fill first half of buffer
-	jc exit
-	sub dwSize, eax
-	invoke fileread, hFile, si, dwSize	; fill second half of buffer
-	jc exit
-	sub dwSize, eax
-
-if USEVDS
-	smsw ax
-	test al, 1
-	.if ZERO?
-		invoke printf, CStr("CPU not in V86 mode",10)
-		jmp exit
-	.endif
-	push es
-	push 40h
-	pop es
-	test byte ptr es:[7bh], 20h
-	pop es
-	.if ZERO?
-		invoke printf, CStr("VDS API not implemented",10)
-		jmp exit
-	.endif
-	mov dds.dwSize, SAMPLEBUFFERLENGTH
-	mov eax, [dwSampleBuffer]
-	mov dds.dwOfs, eax
-	mov dds.wSeg, 0
-	mov di, offset dds
-	mov dx, VDSF_COPY
-	mov ax, 8107h		; request DMA buffer
-	int 4Bh
+	call ResetDSP
 	.if CARRY?
-		cbw
-		invoke printf, CStr("VDS request DMA buffer failed, error=%X",10), ax
-		jmp exit
-	.elseif bVerbose
-		invoke printf, CStr("VDS DMA buffer (%lX) will be used, size=0x%X",10), [dds.dwPhys], SAMPLEBUFFERLENGTH
+		invoke printf, CStr('No SoundBlaster found at 0x%x',lf), [wBase]
+		stc
+		ret
 	.endif
-endif
+
+;--- check if it's a SB16
+	invoke ReadDSPWord, DSP_VERSION
+	.if ax < 400h
+		invoke printf, CStr('No SB16 found, DSP version=%X',lf), ax
+		stc
+		ret
+	.endif
+
+	mov bInit, 1
 
 ;--- setup isr
 
-	in al,021h
-	mov bOldMask, al
+	WriteDSP [wBase], DSP_ENABLESPEAKER
 
 	mov al, byte ptr [wIrq]
 	.if ( al < 8 )
@@ -833,6 +796,12 @@ endif
 
 ;--- enable sound IRQ
 
+	in al, 021h
+	mov ah, al
+	in al, 0A1h
+	xchg al,ah
+	mov wOldMask, ax
+
 	mov dx, 21h
 	mov bx, [wIrq]
 	cmp bx, 8
@@ -844,27 +813,10 @@ endif
 	btr ax, bx
 	out dx, al
 
-;--- init SB and DMA hardware
-
-	call ResetDSP
-	.if CARRY?
-		invoke printf, CStr('No SoundBlaster found at 0x%x',10), [wBase]
-		jmp exit3
-	.endif
-
-;--- check if it's a SB16
-	invoke ReadDSPWord, DSP_VERSION
-	.if ax < 400h
-		invoke printf, CStr('No SB16 found, DSP version=%X',10), ax
-		jmp exit3
-	.endif
-
-	WriteDSP [wBase], DSP_ENABLESPEAKER
-
 ;--- Setup DMA-controller
 	call setdmaports
 	.if bVerbose
-		invoke printf, CStr("DMA ports addr/cnt/page=%X/%X/%X",10), wDmaBaseChn, wDmaCntChn, wDmaPageChn
+		invoke printf, CStr("DMA ports addr/cnt/page=%X/%X/%X",lf), wDmaBaseChn, wDmaCntChn, wDmaPageChn
 	.endif
 
 ;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
@@ -889,11 +841,8 @@ endif
 ;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
 ; 4th  WRITE PAGE NUMBER
 ;
-if USEVDS
-	mov esi, [dds.dwPhys]
-else
 	mov esi, [dwSampleBuffer]
-endif
+
 	mov eax, esi
 	shr eax, 16
 ;	cmp wDmaBaseChn, 10h
@@ -942,7 +891,7 @@ endif
 ; 1st  SET SAMPLERATE
 ;
 	WriteDSP [wBase], DSP_SETOUTSAMPLERATE
-	mov ecx, wavefmt.nSamplesPerSec
+	mov ecx, nSamplesPerSec
 	WaitWrite
 	mov al,ch
 	out dx,al
@@ -954,7 +903,7 @@ endif
 ;
 	WaitWrite
 	mov ax, 030B6h				;B6,30 = DMA DAC 16bit autoinit, stereo, signed
-	cmp wavefmt.wBitsPerSample, 16
+	cmp wBitsPerSample, 16
 	jz @F
 	mov ax, 000C6h				;C6,00 = DMA DAC 8bit autoinit, mono, unsigned
 @@:
@@ -970,99 +919,26 @@ endif
 	WaitWrite
 	mov al, ch					; HIGHER PART SAMPLELENGTH
 	out dx, al
-
-; TRANSFER STARTS NOW
-
-	call gettimer
-	mov dwTimer, eax
-waitloop:
-if 1
-	.if bVerbose
-		call gettimer
-		sub eax, dwTimer
-		cmp eax, 5
-		jb @F
-		add dwTimer, eax
-		call dispdmastatus
-@@:
-	.endif
-endif
-	mov ah,01					;AH = Check for character function
-	int 16h
-	jz @F
-	mov ah,0
-	int 16h
-	cmp ah,1
-	jz exit
-@@:
-	cmp [bReady],0				; interrupt occured?
-	jz waitloop
-	mov [bReady],0
-	cmp dwSize, 0
-	jz done
-	invoke fileread, hFile, pSampleBuffer, dwSize
-	jc exit
-	sub dwSize, eax
-if USEVDS
-	mov di, offset dds
-	mov dds.dwSize, SAMPLEBUFFERLENGTH shr 1
-	mov bx, 0
-	mov cx, 0
-	test dwChunks, 1
-	jnz @F
-	mov cx, SAMPLEBUFFERLENGTH shr 1
-@@:
-	mov dx, 0
-	mov ax, 8109h		; copy into DMA buffer
-	int 4Bh
-	.if CARRY?
-		cbw
-		invoke printf, CStr("VDS copy into DMA buffer failed, error=%X",10), ax
-	.endif
-endif
-	jmp waitloop
-done:
-if 1
-;--- wait till the last half has been played
-	invoke fileread, hFile, pSampleBuffer, dwSize
-@@:
-	cmp [bReady],0
-	jz @B
-endif
-	.if bVerbose
-		invoke printf, CStr(10)
-		call dispdmastatus
-		invoke printf, CStr(10)
-	.endif
-
+	clc
 exit:
-;	WriteDSP [wBase], DSP_PAUSE8BIT
-	call ResetDSP
-exit3:
-;--- RESTORE PIC MASK
-	mov al, bOldMask
-	out 21h, al
+	ret
 
-if USEVDS
-	cmp dds.dwOfs,0		; initialized?
-	jz @F
-	mov di, offset dds
-	mov dx, 0
-	mov ax, 8108h
-	int 4Bh
-	.if CARRY?
-		cbw
-		invoke printf, CStr("VDS release DMA buffer failed, error=%X",10), ax
-	.endif
-@@:
-endif
+InitSB endp
+
+;--- deinit SB hardware
+
+ExitSB proc
+
+	cmp bInit, 0
+	jz exit    
+	call ResetDSP
+;--- restore PIC masks
+	mov ax, wOldMask
+	out 21h, al
+	mov al, ah
+	out 0A1h, al
 
 ;--- RESTORE IRQ
-	mov dx, word ptr [OldIntSB+0]
-	mov cx, word ptr [OldIntSB+2]
-	mov ax, cx
-	or ax, dx
-	jz exit2
 	mov al, byte ptr [wIrq]
 	.if ( al < 8 )
 		add al, 8
@@ -1070,17 +946,173 @@ endif
 		add al, 68h
 	.endif
 	push ds
-	mov ds, cx
+	lds dx, [OldIntSB]
 	mov ah, 25h
 	int 21h
 	pop ds
-exit2:
-	mov bx, hFile
-	cmp bx, -1
+exit:
+	ret
+ExitSB endp
+
+main proc c argc:word, argv:ptr
+
+local dwTimer:dword
+local dwSectors:dword
+local track:byte
+local lasttrack:byte
+local szVar[64]:byte
+
+	mov cs:[dsseg], ds
+	push ds
+	pop es
+	mov track,0
+
+;--- get BLASTER settings
+
+	invoke GetEnvironmentVariable, CStr("BLASTER"), addr szVar, sizeof szVar
+	.if ax
+		invoke ScanBlasterVar, addr szVar
+	.endif
+
+;--- CD-ROM installed?
+
+	mov ax,1500h
+	mov bx,0000
+	int 2Fh
+	cmp bx,0000
+	jnz cd_found
+	invoke printf, CStr("no CD-ROM drive found",lf)
+	jmp exit
+cd_found:
+	mov wDrive, cx
+
+	mov req80.stasecs,0
+
+	add argv, 2
+	mov bx, argv
+nexttrack:
+	.while word ptr [bx]
+		mov si, [bx]
+		add bx, 2
+		lodsw
+		.if al >= '0' && al <= '9'
+			sub si,2
+			mov cl,10
+			call getnum
+			.if byte ptr [si]
+				invoke printf, CStr("invalid digit: %s",lf), si
+				jmp exit
+			.endif
+			mov track, al
+			.break
+		.elseif al == '/' || al == '-'
+			or ah,20h
+			.if ah == "q"
+				mov bVerbose, 0
+			.else
+				mov bHelp, 1
+			.endif
+		.else
+			mov bHelp, 1
+		.endif
+	.endw
+	mov argv, bx
+
+	cmp bHelp, 0
 	jz @F
-	mov ah, 3Eh
-	int 21h
+	invoke printf, CStr("%s"), offset szHelp
+	jmp exit
 @@:
+
+;--- get volume size info (# of sectors)
+
+	invoke getvolsize
+	jc exit
+	mov dwSectors, eax
+
+;--- get TOC info ( first track, last track) in AL/AH
+	invoke getdiskinfo
+	mov lasttrack, ah
+
+	.if track
+		invoke gettrackinfo, track
+		jc exit
+		mov req80.stasecs, eax
+		movzx ax, track
+		.if al < lasttrack
+			inc al
+			invoke gettrackinfo, ax
+			mov dwSectors, eax
+		.endif
+	.endif
+
+	.if bVerbose
+		invoke printf, CStr("SB base=%X, irq=%u, dma=%u, hdma=%u",lf), wBase, wIrq, wDmaL, wDmaH
+	.endif
+
+;--- set linear address (dwSampleBuffer) and offset (pSampleBuffer) of sample buffer
+
+	call getsamplebufferaddr
+	jc exit
+	.if bVerbose
+		invoke printf, CStr("sample buffer linear address=%lX",lf), [dwSampleBuffer]
+	.endif
+
+;--- fill sample buffer
+
+	mov si, [pSampleBuffer]
+	invoke cdread, si
+	jc exit
+	invoke cdread, si
+	jc exit
+
+;--- init SB hardware
+
+	call InitSB
+	jc exit
+
+	call gettimer
+	mov dwTimer, eax
+waitloop:
+	.if bVerbose
+		call gettimer
+		sub eax, dwTimer
+		cmp eax, 5
+		jb @F
+		add dwTimer, eax
+		invoke printf, CStr("curr sector: %lu",13), req80.stasecs
+@@:
+	.endif
+	mov ah,01			; key pressed?
+	int 16h
+	jz @F
+	mov ah,0
+	int 16h
+	cmp ah,1
+	jz exit
+@@:
+	cmp [bReady],0		; SB interrupt occured?
+	jz waitloop
+	mov [bReady],0
+	mov eax, dwSectors
+	cmp eax, req80.stasecs
+	jbe done
+	invoke cdread, pSampleBuffer
+	jc exit
+	jmp waitloop
+done:
+;--- wait till the last half has been played
+@@:
+	cmp [bReady],0
+	jz @B
+	.if bVerbose
+		invoke printf, CStr(10)
+	.endif
+	mov bx, argv
+	cmp word ptr [bx],0
+	jnz nexttrack
+exit:
+	call ExitSB
 	ret
 
 main endp
