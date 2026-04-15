@@ -2,19 +2,45 @@
 ;--- Play CD Audio with Cxh/Bxh commands on SoundBlaster 16/16ASP.
 ;--- Public Domain, written by Andreas Grech.
 
+_BSS segment para public 'BSS'  ; alignment
+_BSS ends
+
 	.286
-	.MODEL small
+	.MODEL tiny
 	.dosseg
 	.stack 2048
 	option casemap:none
 	option proc:private
 	.386
 
-;--- defaults ( overwritten by BLASTER environment variable )
+?SECSIZE equ 2352	;raw mode sector size
+
+;--- output buffer (=sample buffer) must fit in 64 kB
+;--- 65536 / 2352 = max 27 sectors
+
+?BUFFERS equ 3	;sample buffer is a triple buffer
+
+SAMPLEBUFFERLENGTH equ ?SECSIZE * ?BUFFERS * 4
+
+;--- input buffer is in extended memory
+
+INBUFSIZEKB equ 1024 ; XMS buffer's size in kB!
+
+;--- each xms read/write has size SAMPLEBUFFERLENGTH / ?BUFFERS
+;--- so the XMS ring buffer will wrap at:
+
+INBUFSIZE equ (INBUFSIZEKB shl 10) / (SAMPLEBUFFERLENGTH / ?BUFFERS) * (SAMPLEBUFFERLENGTH / ?BUFFERS)
+
+;--- SB defaults ( overwritten by BLASTER environment variable )
 BASEADDR	EQU 220h	; base address
 SBIRQ		EQU 5		; IRQ
 DMALOW		EQU 1		; DMA channel
 DMAHIGH 	EQU 5		; HDMA channel
+
+MAXTRKS  equ 32
+
+nSamplesPerSec equ 44100
+wBitsPerSample equ 16
 
 ;--- CD-ROM access
 
@@ -31,6 +57,17 @@ RB_MODE  equ 01h
 COOKED   equ 00h
 RAW      equ 01h
 
+;--- DMA WRITE MODE
+WANTEDMODE  EQU DMA_MODE_SINGLE + DMA_MODE_AUTOINIT + DMA_MODE_READ
+
+PGMNAME textequ <"SB16CDr">
+
+BIOSTIMER equ 46Ch	; BIOS data address of current PIT value
+
+lf equ 10
+
+;--- structures
+
 reqhdr  struct
 len     db ?
 subunit db ?
@@ -39,6 +76,17 @@ status  dw ?
 res1    dd ?
 res2    dd ?
 reqhdr  ends
+
+REDBOOK struct
+union
+	dd ?
+struct
+_f	db ?
+_s	db ?
+_m	db ?
+ends
+ends
+REDBOOK ends
 
 cmd03   struct      ;read ioctl
         reqhdr <>
@@ -52,25 +100,24 @@ cmd80   struct
 mode    db ?         ;addressing mode (0=HSG,1=red book)
 address dd ?         ;transfer address
 numsecs dw ?         ;number of sectors to read
-stasecs dd ?         ;start of sectors to read
+stasecs REDBOOK <>   ;start of sectors to read
 readmod db ?         ;00=cooked (2048),01=raw (2356)
 intsize db ?         ;interleave
 intskip db ?         ;interleave
 cmd80   ends
 
-;----------------------
-
-PGMNAME textequ <"SB16CDr">
-
-BIOSTIMER equ 46Ch	; BIOS data address of current PIT value
-
-lf equ 10
+XMSBM struct	;XMS block move struct
+dwSize dd ?
+hSrc   dw ?
+ofsSrc dd ?
+hDst   dw ?
+ofsDst dd ?
+XMSBM ends
 
 	include dma.inc
 	include sbequ.inc
 
-; DMA WRITE MODE
-WANTEDMODE  EQU DMA_MODE_SINGLE + DMA_MODE_AUTOINIT + DMA_MODE_READ
+;--- macros
 
 CStr macro text:vararg
 local sym
@@ -110,16 +157,16 @@ WriteDSP macro Base, cmd
 	out dx, al
 endm
 
-?SECSIZE equ 2352
-
-SAMPLEBUFFERLENGTH equ ?SECSIZE*4
-
 	.data
 
-OldIntSB    dd 0
+OldIntSB    dd 0	;old value of SB IRQ
+OldInt15    dd 0	;old value of Int 15h
+
 dwSampleBuffer dd 0   ; linear address sample buffer
-dwChunks	dd 0
-pSampleBuffer dw offset samplebuffer ; near ptr sample buffer
+pSampleBuffer  dw offset samplebuffer   ; offset sample buffer
+pReadBuffer    dw offset samplebuffer + SAMPLEBUFFERLENGTH   ; offset buffer for CD Input
+wData          dw 0,0
+
 wBase		dw BASEADDR
 wIrq		dw SBIRQ
 wDmaL		dw DMALOW
@@ -127,10 +174,11 @@ wDmaH		dw DMAHIGH
 wType		dw 0
 wOldMask	dw 0
 
-bInit		db 0
+bSBInit		db 0
 bVerbose	db 1
 bHelp		db 0
-bReady		db 0
+bPaused		db 0
+bExit		db 0
 
 	align word
 
@@ -140,15 +188,19 @@ wDmaPageChn dw 0
 wDmaWriteMask dw 0
 wDmaWriteMode dw 0
 wDmaClearFlipFlop dw 0
-wDrive dw 0
-wBitsPerSample dw 16
-nSamplesPerSec dd 44100
+wDrive dw 0		; CD drive #
+wSecsInBuf dw 0	; current sectors in read buffer
 
-req03   cmd03  <>	;ioctl
-req80   cmd80  <>	;read long
+xmsdrv  dd 0	; XMS driver entry
+xmswrite XMSBM <SAMPLEBUFFERLENGTH / ?BUFFERS,0,0,0,0>
+xmsread  XMSBM <SAMPLEBUFFERLENGTH / ?BUFFERS,0,0,0,0>
+req03   cmd03 <>	;ioctl
+req80   cmd80 <>	;read long
 
 	.data?
 
+;--- sample buffer is allocated twice - so it's ensured
+;--- that at least one won't cross the 64 kB border.
 samplebuffer db SAMPLEBUFFERLENGTH * 2 dup (?)
 
 	.const
@@ -162,15 +214,43 @@ szHelp label byte
 	db " -? : this help",lf
 	db " -q : be quiet",lf
 	db "If track# is omitted, all tracks are rendered.",lf
-	db "Stop playing with <ESC>.",lf
+	db "ESC exits playing, SPACE pauses.",lf
 	db 0
 
 	.code
 
-dsseg dw 0
-
 	include printf.inc
 
+;--- copy PCM chunk from XMS input buffer to sample buffer
+
+fillsamplebuffer proc uses si eax
+
+;--- copy block
+
+	mov si, offset xmsread
+	mov ah, 0Bh
+	call xmsdrv
+;--- adjust dst offset for next read
+	mov dx, pSampleBuffer
+	add dx, SAMPLEBUFFERLENGTH
+	mov ax, word ptr [si].XMSBM.ofsDst+0
+	add ax, SAMPLEBUFFERLENGTH / ?BUFFERS
+	cmp ax, dx
+	jnz @F
+	mov ax, pSampleBuffer
+@@:
+	mov word ptr [si].XMSBM.ofsDst+0, ax
+;--- adjust src offset for next read
+	mov eax, [si].XMSBM.ofsSrc
+	add eax, SAMPLEBUFFERLENGTH / ?BUFFERS
+	cmp eax, INBUFSIZE
+	jb @F
+	mov eax, 0
+@@:
+	mov [si].XMSBM.ofsSrc, eax
+	sub wSecsInBuf, SAMPLEBUFFERLENGTH / (?BUFFERS * ?SECSIZE)	;adjust input buffer
+	ret
+fillsamplebuffer endp
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
 ; Our IRQ handler for detecting end of playing
 ; It's generated by the SoundBlaster hardware
@@ -179,15 +259,12 @@ sbirqproc proc
 	push ax
 	push dx
 	push ds
-	mov ds, cs:[dsseg]
-	mov [bReady], 1
-if 0	; debugging
-	push bx
-	mov bh,0
-	mov ax,0E00h or '.'
-	int 10h
-	pop bx
-endif
+	mov ax, cs
+	mov ds, ax
+
+	sti
+	call fillsamplebuffer
+
 	mov dx, [wBase]
 if 1
 	mov ax, SB_DSPINTACK	; VSB is happy with 22Eh or 22Fh, but real SB needs 22Eh for 8 bit!
@@ -207,7 +284,6 @@ endif
 	pop ds
 	pop dx
 	pop ax
-	sti
 	IRET
 sbirqproc endp
 
@@ -270,7 +346,7 @@ GetEnvironmentVariable endp
 ;---     si -> behind number
 ;--- Z if no valid digit found
 
-getnum proc uses bx
+atoi proc uses bx
 	mov bx, si
 	xor edx, edx
 	movzx ecx, cl
@@ -295,7 +371,7 @@ exit:
 	mov eax, edx
 	cmp si, bx
 	ret
-getnum endp
+atoi endp
 
 ;--- scan BLASTER variable, overwrite
 ;--- default values in wBase, wIrq, wDmaL, wDmaH, wType
@@ -329,7 +405,7 @@ ScanBlasterVar proc stdcall uses si pVar:ptr
 			.continue
 		.endif
 		dec si
-		call getnum
+		call atoi
 		jz numdone
 		.if (bx != -1)
 			mov [bx], ax
@@ -341,7 +417,7 @@ ScanBlasterVar endp
 
 ;--- send device driver request
 
-SendReq proc stdcall req:ptr BYTE
+SendReq proc stdcall uses bx req:ptr BYTE
 
 	mov bx,req
 	push ds
@@ -380,16 +456,12 @@ local ctl08:ioctl08
 	jc error
 	test req03.status, 8000h
 	jnz error
-	.if bVerbose
-		invoke printf, CStr("IOCTL volume size: [%X] sectors=%lu",lf), req03.status, ctl08.sectors
-	.endif
 	mov eax, ctl08.sectors
 	clc
 	ret
 error:
 	invoke printf, CStr("IOCTL volume size: failed [%X]",lf), req03.status
-	mov eax, -1
-	clc
+	stc
 	ret
 
 getvolsize endp
@@ -398,14 +470,7 @@ ioctl10 struct	;audio disk info
 cmd     db ?
 first   db ?
 last    db ?
-union
-leadout dd ?
-struct
-leadout_f db ?
-leadout_s db ?
-leadout_m db ?
-ends
-ends
+leadout REDBOOK <>
 ioctl10 ends
 
 getdiskinfo proc
@@ -423,12 +488,9 @@ local ctl10:ioctl10
 	jc error
 	test req03.status, 8000h
 	jnz error
-	.if bVerbose
-		invoke printf, CStr("IOCTL disk info: [%X] tracks=%u-%u, leadout=%02u:%02u:%02u",lf),
-			req03.status, ctl10.first, ctl10.last, ctl10.leadout_m, ctl10.leadout_s, ctl10.leadout_f
-	.endif
 	mov al, ctl10.first
 	mov ah, ctl10.last
+	mov edx, ctl10.leadout
 	clc
 	ret
 error:
@@ -441,16 +503,11 @@ getdiskinfo endp
 ioctl11 struct	;audio track info
 cmd     db ?
 track   db ?
-union
-start   dd ?
-struct
-start_f db ?
-start_s db ?
-start_m db ?
-ends
-ends
+start   REDBOOK <>
 ctlinfo db ?    ; bit 6=1 -> data track
 ioctl11 ends
+
+;--- out: eax=start sector, edx=start (MSF), cx=0 if audio, 1 if data
 
 gettrackinfo proc stdcall track:word
 
@@ -469,54 +526,84 @@ local ctl11:ioctl11
 	jc error
 	test req03.status, 8000h
 	jnz error
+	mov eax, ctl11.start
+	call Rb2Lba   ; convert RedBook in EAX to LBA
+	mov edx, ctl11.start
+	xor cx, cx
 	test ctl11.ctlinfo, 40h
 	jnz error2
-	mov eax, ctl11.start
-	call CvtLBA   ; convert RedBook in EAX to LBA
-	.if bVerbose
-		push eax
-		mov ecx, eax
-		invoke printf, CStr("IOCTL track info(%u): [%X] start=%lu (RedBook=%02u:%02u:%02u)",lf),
-        	track, req03.status, ecx, ctl11.start_m, ctl11.start_s, ctl11.start_f
-		pop eax
-	.endif
 	ret
 error:
 	invoke printf, CStr("IOCTL track info(%u): failed [%X]",lf), track, req03.status
 	stc
 	ret
 error2:
-	invoke printf, CStr("IOCTL track info(%u): [%X] data track",lf), track, req03.status
-	stc
+	inc cx
+	clc
 	ret
 gettrackinfo endp
 
-;--- read CD
-;--- out: NC: read ok, eax=bytes read
+;--- read CD and copy sectors to XMS input buffer
+;--- out: NC: read ok
 
-cdread proc stdcall pBuffer:ptr
+cdread proc stdcall uses si bx max:dword
 
-	mov dx, pBuffer
-	test dwChunks, 1
-	jz @F
-	add dx, SAMPLEBUFFERLENGTH shr 1
-@@:
-	mov req80.len,sizeof cmd80
-	mov req80.subunit,00
-	mov req80.cmd,READLONG
-	mov req80.mode,HSG_MODE
-	mov word ptr req80.address+0, dx
-	mov word ptr req80.address+2, ds
-	mov word ptr req80.numsecs+0, (SAMPLEBUFFERLENGTH shr 1) / ?SECSIZE
+	mov req80.len, sizeof cmd80
+	mov req80.subunit, 0
+	mov req80.cmd, READLONG
+	mov req80.mode, HSG_MODE
+;	mov ax, pReadBuffer
+;	mov word ptr req80.address+0, ax
+;	mov word ptr req80.address+2, ds
+	mov eax, max
+	sub eax, req80.stasecs
+	jz exit
+	.if eax > SAMPLEBUFFERLENGTH / (?BUFFERS * ?SECSIZE)
+		mov eax, SAMPLEBUFFERLENGTH / (?BUFFERS * ?SECSIZE)
+	.endif
+	mov req80.numsecs, ax
 	mov word ptr req80.readmod, RAW
 
 	invoke SendReq, addr req80
 	jc error
 	test req80.status, 8000h
 	jnz error
-	add req80.stasecs, (SAMPLEBUFFERLENGTH shr 1) / ?SECSIZE
-	inc dwChunks
-	movzx eax, ax
+
+;--- if no full chunk was read, fill the rest with "silence"
+
+	movzx eax, req80.numsecs
+	add req80.stasecs, eax
+	.if ax < SAMPLEBUFFERLENGTH / ( ?BUFFERS * ?SECSIZE)
+		imul ax, ?SECSIZE
+		push di
+		les di, req80.address
+		mov cx, SAMPLEBUFFERLENGTH / ?BUFFERS
+		add di, ax
+		sub cx, ax
+		shr cx, 1
+		xor ax, ax
+		cld
+		rep stosw
+		pop di
+;		invoke printf, CStr("read %u sectors only, rest of buffer cleared",lf), req80.numsecs
+	.endif
+
+;--- copy the sectors to XMS input buffer
+
+	mov si, offset xmswrite
+	mov ah,0Bh
+	call xmsdrv
+;--- adjust offset for next write op
+	mov eax, [si].XMSBM.ofsDst
+	add eax, SAMPLEBUFFERLENGTH / ?BUFFERS
+	cmp eax, INBUFSIZE
+	jb @F
+	mov eax, 0
+@@:
+	mov [si].XMSBM.ofsDst, eax
+	add wSecsInBuf, SAMPLEBUFFERLENGTH / (?BUFFERS * ?SECSIZE)	;adjust input buffer sector count
+exit:
+	clc
 	ret
 error:
 	invoke printf, CStr("Read long(%lu): failed [%X]",lf), req80.stasecs, req80.status
@@ -574,50 +661,40 @@ GetDmaChannel proc
 	ret
 GetDmaChannel endp
 
-;--- get linear address and offset of sample buffer.
-;--- (must not cross a 64-kB boundary)
-;--- linear address (=dwSampleBuffer) is used for DMAcontroller page & offset
-;--- offset address (=pSampleBuffer) is used for file reads
+;--- setup sample buffer.
+;--- will calculate linear address and (near16) offset of sample buffer.
+;--- linear address (=dwSampleBuffer) is used for DMAcontroller page & offset.
 
-getsamplebufferaddr proc uses esi
+setupsamplebuffer proc uses esi
 
 	mov ax, ds
-	movzx eax,ax
+	movzx eax, ax
 	shl eax, 4
 	add eax, offset samplebuffer
 
 	mov esi, eax
-	mov ecx, SAMPLEBUFFERLENGTH
-	lea eax, [esi+ecx-1]
+	add eax, SAMPLEBUFFERLENGTH-1   ; eax -> last byte of buffer
 	mov edx, esi
 	shr eax, 16
 	shr edx, 16
-	cmp ax, dx				;does a 64kb segment overrun occur?
+	cmp ax, dx				;64kb segment overrun?
 	jz @F
-
-	shl eax, 16
-	mov edx, eax			;eax & edx = linear address of 64kb segment to use
-	sub edx, esi			;edx = difference to linear address of original sample buffer
-	add [pSampleBuffer], dx	;adjust offset
-
-	mov esi, eax
+	add esi, SAMPLEBUFFERLENGTH
+	mov ax, pReadBuffer
+	xchg ax, pSampleBuffer
+	mov pReadBuffer, ax
 @@:
-	mov eax, esi
-
-	mov [dwSampleBuffer], eax
-	clc
+	mov [dwSampleBuffer], esi
 	ret
+setupsamplebuffer endp
 
-getsamplebufferaddr endp
-
-;--- return #samples in one half of sample buffer (ecx).
+;--- OUT: ecx = #samples in one part of sample buffer.
 ;--- this will be the value for the DSP play cmd.
-;--- stereo are 2 samples, so just the bits/sample are relevant.
 ;--- edx must be preserved.
 
 getsamplebufferlength proc
 
-	mov ecx, SAMPLEBUFFERLENGTH shr 1
+	mov ecx, SAMPLEBUFFERLENGTH / ?BUFFERS
 	shr ecx, 1
 	ret
 getsamplebufferlength endp
@@ -707,7 +784,7 @@ ReadDSPWord endp
 
 ;--- convert redbook address in EAX to LBA
 
-CvtLBA proc
+Rb2Lba proc
 	mov cx,ax		;Save "seconds" & "frames" in CX-reg.
 	shr eax,16		;"minute" value to AX
 	cmp ax,99		;Is "minute" value too large?
@@ -721,19 +798,22 @@ CvtLBA proc
 	mov edx,60
 	mul dl
 	mov dl,ch		;add "second" value.
-	add ax,dx		;now ax contains seconds
+	add ax,dx		;now ax has seconds
 
 ;--- convert seconds to frames
 	mov dl,75
-	mul edx
-	mov dl,150		;add "frame" value by subtracting it from "2 sec" offset
-	sub dl,cl
-	sub eax,edx
+	mul edx			;now eax has frames
+
+	mov dl, cl
+	add eax, edx	;add "frame" value
+
+	sub eax, 2*75	;subtract 2 sec leadin
+
 	ret
 error:
 	mov eax,100*60*75	;error, set value to max (450.000)
 	ret
-CvtLBA endp
+Rb2Lba endp
 
 ;--- get current PIT timer 0 value
 
@@ -744,15 +824,9 @@ gettimer proc uses ds
 	ret
 gettimer endp
 
-;--- init SB hardware, including ISA DMA
+;--- reset SB hardware
 
-InitSB proc
-
-	cmp bInit, 1
-	jz exit    
-
-;--- init SB and DMA hardware
-
+ResetSB proc
 	call ResetDSP
 	.if CARRY?
 		invoke printf, CStr('No SoundBlaster found at 0x%x',lf), [wBase]
@@ -767,8 +841,13 @@ InitSB proc
 		stc
 		ret
 	.endif
+	ret
+ResetSB endp
 
-	mov bInit, 1
+
+;--- init SB hardware, including ISA DMA
+
+InitSB proc
 
 ;--- setup isr
 
@@ -812,12 +891,6 @@ InitSB proc
 	in al, dx
 	btr ax, bx
 	out dx, al
-
-;--- Setup DMA-controller
-	call setdmaports
-	.if bVerbose
-		invoke printf, CStr("DMA ports addr/cnt/page=%X/%X/%X",lf), wDmaBaseChn, wDmaCntChn, wDmaPageChn
-	.endif
 
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
 ; 1st  MASK DMA CHANNEL
@@ -899,14 +972,10 @@ InitSB proc
 	mov al,cl
 	out dx,al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 2nd  play 8/16bit stereo (B6 30)/mono (C6 00) XX XX
+; 2nd  play 16bit stereo B6 30 XX XX
 ;
 	WaitWrite
 	mov ax, 030B6h				;B6,30 = DMA DAC 16bit autoinit, stereo, signed
-	cmp wBitsPerSample, 16
-	jz @F
-	mov ax, 000C6h				;C6,00 = DMA DAC 8bit autoinit, mono, unsigned
-@@:
 	out dx, al
 	WaitWrite
 	mov al, ah					;AL = stereo signed / mono unsigned
@@ -919,8 +988,10 @@ InitSB proc
 	WaitWrite
 	mov al, ch					; HIGHER PART SAMPLELENGTH
 	out dx, al
+
+	mov bSBInit, 1
+
 	clc
-exit:
 	ret
 
 InitSB endp
@@ -929,7 +1000,7 @@ InitSB endp
 
 ExitSB proc
 
-	cmp bInit, 0
+	cmp bSBInit, 0
 	jz exit    
 	call ResetDSP
 ;--- restore PIC masks
@@ -954,18 +1025,70 @@ exit:
 	ret
 ExitSB endp
 
+myint15 proc
+	pushf
+	cmp ah,4fh
+	jz @F
+defint15:
+	popf
+	jmp cs:[OldInt15]
+@@:
+	cmp al,1          ;ESC?         
+	jz is_esc
+	cmp al,39h        ;SPACE?
+	jnz defint15
+	inc cs:[bPaused]
+	popf
+	push bp
+	mov bp,sp
+	and byte ptr [bp+2+2+2],not 1 ;clear CF
+	pop bp
+	iret
+is_esc:
+	mov cs:[bExit], 1
+	jmp defint15
+myint15 endp
+
 main proc c argc:word, argv:ptr
 
 local dwTimer:dword
 local dwSectors:dword
 local track:byte
-local lasttrack:byte
-local szVar[64]:byte
+local cnttrk:byte
+local first:byte
+local last:byte
+local leadout:REDBOOK
+local start:REDBOOK
+local trks[MAXTRKS]:byte
+local szVar[4*MAXTRKS]:byte
 
-	mov cs:[dsseg], ds
+	mov track,0
+	mov cnttrk,0
+
+;--- keyboard check
+
+	mov ax, 3515h
+	int 21h
+	mov word ptr [OldInt15+0], bx
+	mov word ptr [OldInt15+2], es
+	mov dx, offset myint15
+	mov ax, 2515h
+	int 21h
+
+	mov ax, 4300h
+	int 2Fh
+	test al, 80h
+	.if ZERO?
+		invoke printf, CStr("no XMM installed",lf)
+		jmp exit
+	.endif
+	mov ax, 4310h
+	int 2Fh
+	mov word ptr xmsdrv+0, bx
+	mov word ptr xmsdrv+2, es
+
 	push ds
 	pop es
-	mov track,0
 
 ;--- get BLASTER settings
 
@@ -974,37 +1097,34 @@ local szVar[64]:byte
 		invoke ScanBlasterVar, addr szVar
 	.endif
 
-;--- CD-ROM installed?
+;--- SB & CD: setup dwSampleBuffer, pSampleBuffer, pReadBuffer
 
-	mov ax,1500h
-	mov bx,0000
-	int 2Fh
-	cmp bx,0000
-	jnz cd_found
-	invoke printf, CStr("no CD-ROM drive found",lf)
-	jmp exit
-cd_found:
-	mov wDrive, cx
+	call setupsamplebuffer
 
-	mov req80.stasecs,0
+;--- Setup DMA-controller ports
 
-	add argv, 2
+	call setdmaports
+
 	mov bx, argv
-nexttrack:
-	.while word ptr [bx]
+	add bx, 2
+	lea di, trks
+	push ds
+	pop es
+
+	.while word ptr [bx] && cnttrk < MAXTRKS
 		mov si, [bx]
 		add bx, 2
 		lodsw
 		.if al >= '0' && al <= '9'
 			sub si,2
 			mov cl,10
-			call getnum
+			call atoi
 			.if byte ptr [si]
 				invoke printf, CStr("invalid digit: %s",lf), si
 				jmp exit
 			.endif
-			mov track, al
-			.break
+			stosb
+			inc cnttrk
 		.elseif al == '/' || al == '-'
 			or ah,20h
 			.if ah == "q"
@@ -1016,7 +1136,6 @@ nexttrack:
 			mov bHelp, 1
 		.endif
 	.endw
-	mov argv, bx
 
 	cmp bHelp, 0
 	jz @F
@@ -1024,95 +1143,222 @@ nexttrack:
 	jmp exit
 @@:
 
-;--- get volume size info (# of sectors)
+;--- CD-ROM installed?
 
-	invoke getvolsize
+	mov ax,1500h
+	mov bx,0000
+	int 2Fh
+	cmp bx,0000
+	jnz @F
+	invoke printf, CStr("no CD-ROM drive found",lf)
+	jmp exit
+@@:
+	mov wDrive, cx
+
+	call ResetSB	; SB hardware ok?
 	jc exit
-	mov dwSectors, eax
 
-;--- get TOC info ( first track, last track) in AL/AH
-	invoke getdiskinfo
-	mov lasttrack, ah
+;--- get read buffer memory (XMS)
 
-	.if track
-		invoke gettrackinfo, track
-		jc exit
-		mov req80.stasecs, eax
-		movzx ax, track
-		.if al < lasttrack
-			inc al
-			invoke gettrackinfo, ax
-			mov dwSectors, eax
-		.endif
+	mov ah, 9
+	mov dx, INBUFSIZEKB
+	call xmsdrv
+	.if !ax
+		invoke printf, CStr("not enough XMS memory",lf)
+		jmp exit
 	.endif
+	mov xmswrite.hDst, dx
+	mov xmsread.hSrc, dx
+	mov ax, pSampleBuffer
+	mov dx, pReadBuffer
+	mov word ptr xmswrite.ofsSrc+0, dx
+	mov word ptr xmswrite.ofsSrc+2, ds
+	mov word ptr req80.address+0, dx
+	mov word ptr req80.address+2, ds
+	mov word ptr  xmsread.ofsDst+0, ax
+	mov word ptr  xmsread.ofsDst+2, ds
 
 	.if bVerbose
 		invoke printf, CStr("SB base=%X, irq=%u, dma=%u, hdma=%u",lf), wBase, wIrq, wDmaL, wDmaH
-	.endif
-
-;--- set linear address (dwSampleBuffer) and offset (pSampleBuffer) of sample buffer
-
-	call getsamplebufferaddr
-	jc exit
-	.if bVerbose
 		invoke printf, CStr("sample buffer linear address=%lX",lf), [dwSampleBuffer]
+		invoke printf, CStr("DMA ports addr/cnt/page=%X/%X/%X",lf), wDmaBaseChn, wDmaCntChn, wDmaPageChn
 	.endif
 
-;--- fill sample buffer
+;--- get volume size info (# of sectors);
+;--- also, get TOC info ( first track, last track) in AL/AH
 
-	mov si, [pSampleBuffer]
-	invoke cdread, si
-	jc exit
-	invoke cdread, si
-	jc exit
+	invoke getvolsize
+	.if !CARRY?
+;		mov dwSectors, eax
+		.if bVerbose
+			invoke printf, CStr("IOCTL volume size: sectors=%lu",lf), eax
+		.endif
+	.else
+;		mov dwSectors, 80*60*75
+	.endif
+	invoke getdiskinfo
+	.if !CARRY?
+		mov first, al
+		.if ah <= MAXTRKS
+			mov last, ah
+		.else
+			mov last, MAXTRKS
+		.endif
+		mov leadout, edx
+		.if bVerbose
+			mov eax, edx
+			call Rb2Lba
+			mov edx, eax
+			invoke printf, CStr("IOCTL disk info: tracks=%u-%u, leadout=%lu (%02u:%02u:%02u)",lf),
+				first, last, edx, leadout._m, leadout._s, leadout._f
+		.endif
+	.else
+		mov first, 1
+		mov last, 1
+		mov leadout, 795974h
+	.endif
 
-;--- init SB hardware
+;--- get TOC infos for all tracks
 
-	call InitSB
-	jc exit
+	lea di, szVar
+	movzx bx, first
+	.while bl <= last
+		movzx eax, bl
+		invoke gettrackinfo, ax
+		jc exit
+		stosd
+		.if cx
+			mov ax,bx
+			sub al,first
+			bts wData,ax
+		.endif
+		inc bx
+	.endw
+
+	mov eax, leadout
+	call Rb2Lba   ; convert RedBook in EAX to LBA
+	stosd
+
+;--- if no track given, play the full CD
+	.if !cnttrk
+		push ds
+		pop es
+		lea di, trks
+		mov al, first
+@@:
+		stosb
+		inc al
+		lea cx, trks+MAXTRKS
+		cmp di, cx
+		jz @F
+		cmp al, last
+		jbe @B
+@@:
+		lea ax, trks
+		xchg ax, di
+		sub ax, di
+		mov cnttrk, al
+	.endif
 
 	call gettimer
 	mov dwTimer, eax
-waitloop:
-	.if bVerbose
-		call gettimer
-		sub eax, dwTimer
-		cmp eax, 5
-		jb @F
-		add dwTimer, eax
-		invoke printf, CStr("curr sector: %lu",13), req80.stasecs
-@@:
-	.endif
-	mov ah,01			; key pressed?
-	int 16h
-	jz @F
-	mov ah,0
-	int 16h
-	cmp ah,1
-	jz exit
-@@:
-	cmp [bReady],0		; SB interrupt occured?
-	jz waitloop
-	mov [bReady],0
-	mov eax, dwSectors
-	cmp eax, req80.stasecs
-	jbe done
-	invoke cdread, pSampleBuffer
-	jc exit
-	jmp waitloop
-done:
-;--- wait till the last half has been played
-@@:
-	cmp [bReady],0
-	jz @B
+
+	mov dwSectors, 0
+	lea si, trks
+	movzx bx, cnttrk
+	.while 1
+		mov eax, req80.stasecs
+		.if eax >= dwSectors
+			.if bx
+				dec bx
+				lodsb
+				sub al, first
+				movzx di, al
+				shl di, 2
+				mov ecx, dword ptr [szVar][di]
+				mov eax, dword ptr [szVar][di][4]
+				mov req80.stasecs, ecx
+				mov dwSectors, eax
+				.if bVerbose && bSBInit
+					invoke printf, CStr(10)
+				.endif
+				.if bVerbose
+					invoke printf, CStr("IOCTL track info(%u): start=%lu end=%lu",lf),
+						byte ptr [si-1], req80.stasecs, dwSectors
+				.endif
+				shr di, 2
+				bt wData, di
+				.if CARRY?
+					.if bVerbose
+						invoke printf, CStr("IOCTL track info(%u): data track",lf), byte ptr [si-1]
+					.endif
+					mov dwSectors, 0
+					.continue
+				.endif
+
+				.if !bSBInit
+					mov di, ?BUFFERS
+					.repeat
+						invoke cdread, dwSectors   ; ensure sample buffer isn't empty
+						jc exit
+						call fillsamplebuffer
+						dec di
+					.until !di
+					pusha
+					call InitSB	; init SB hardware
+					popa
+				.endif
+			.else
+				.break .if ( !wSecsInBuf )
+			.endif
+		.endif
+		.if wSecsInBuf < ( INBUFSIZE / ?SECSIZE ); free space in input buffer?
+			invoke cdread, dwSectors
+			jc exit
+			.if bVerbose
+				call gettimer
+				sub eax, dwTimer
+				.if eax >= 5
+					add dwTimer, eax
+					invoke printf, CStr("curr sector: %6lu [%3u]",13), req80.stasecs, wSecsInBuf
+				.endif
+			.endif
+		.endif
+		.if bExit
+			jmp exit
+		.elseif bPaused == 1
+			WriteDSP [wBase], DSP_PAUSE16BIT
+		.elseif bPaused > 1
+			mov bPaused, 0
+			WriteDSP [wBase], DSP_CONTINUE16BIT
+		.else
+			int 28h
+		.endif
+	.endw
 	.if bVerbose
 		invoke printf, CStr(10)
 	.endif
-	mov bx, argv
-	cmp word ptr [bx],0
-	jnz nexttrack
 exit:
 	call ExitSB
+	.if xmswrite.hDst
+		mov dx,xmswrite.hDst
+		mov ah,0Ah
+		call xmsdrv
+	.endif
+	lds dx,[OldInt15]
+	mov ax,2515h
+	int 21h
+
+;--- clear kbd buffer
+	.repeat
+		mov ah,1
+		int 16h
+		.if !ZERO?
+			mov ah,0
+			int 16h
+			and ah,ah
+		.endif
+	.until ZERO?
 	ret
 
 main endp
@@ -1120,13 +1366,20 @@ main endp
 	include setargv.inc
 
 start:
-	mov ax,@data
+	mov ax,cs
 	mov ds,ax
 	mov cx,ss
 	sub cx,ax
 	shl cx,4
 	mov ss,ax
 	add sp,cx
+	mov bx,sp
+	shr bx,4
+	mov cx, es
+	sub ax, cx
+	add bx, ax
+	mov ah, 4Ah
+	int 21h
 	call _setargv
 	invoke main, [_argc], [_argv]
 	mov ax,04c00h

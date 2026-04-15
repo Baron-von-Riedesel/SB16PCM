@@ -7,7 +7,7 @@ Six variants may be created:
 - sb16pcmt: 32-bit protected-mode, model tiny
 - sb16pcmv, 16-bit v86-mode, model small, uses VDS DMA buffer
 - sb16pcmx: 16-bit protected-mode, model small
-- sb16cdr,  16-bit real/v86-mode, model small ( reads Audio CD )
+- sb16cdr,  16-bit real/v86-mode, model small; digital CD player
 
 All variants require a 80386+ cpu.
 
