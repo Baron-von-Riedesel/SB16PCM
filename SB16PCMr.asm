@@ -115,14 +115,15 @@ endif
 OldIntSB    dd 0
 dwSampleBuffer dd 0   ; linear address sample buffer
 dwChunks	dd 0
+dwSizeOrg   dd 0
 pSampleBuffer dw offset samplebuffer ; near ptr sample buffer
 wBase		dw BASEADDR
 wIrq		dw SBIRQ
 wDmaL		dw DMALOW
 wDmaH		dw DMAHIGH
 wType		dw 0
-bVerbose    db 1
-bReady      db 0
+bVerbose	db 1
+bReady		db 0
 bOldMask	db 0
 	align word
 wDmaBaseChn dw 0
@@ -446,8 +447,8 @@ exit:
 	ret
 getfileinfo endp
 
-;--- read file
-;--- out: NC: read ok, eax=bytes read
+;--- read file - no -r option
+;--- out: NC: read ok, eax=new dwSize
 
 fileread proc stdcall hFile:word, pBuffer:ptr, dwSize:dword
 	mov dx, pBuffer
@@ -495,6 +496,60 @@ error:
 	stc
 	ret
 fileread endp
+
+;--- read file - with -r option
+;--- out: NC: read ok, eax=new dwSize
+
+fileread2 proc stdcall hFile:word, pBuffer:ptr, dwSize:dword
+
+local dwMax:dword
+
+	mov dwMax, SAMPLEBUFFERLENGTH shr 1
+	mov dx, pBuffer
+	test dwChunks, 1
+	jz @F
+	add dx, SAMPLEBUFFERLENGTH shr 1
+@@:
+    .while dwMax
+		mov ecx, dwSize
+		cmp ecx, dwMax
+		jb @F
+		mov ecx, dwMax
+@@:
+		mov bx, hFile
+		mov ah, 3Fh
+		int 21h
+		jc error
+if 0
+		pushad
+		invoke printf, CStr("fileread2: read %u bytes at %X",10), ax, dx
+		popad
+endif
+		add dx, ax
+		movzx eax, ax
+		sub dwMax, eax
+		sub dwSize, eax
+		.if ZERO?
+			push dx
+			mov cx,0
+;			mov dx,2Ch
+			mov dx,sizeof RIFFHDR + sizeof WAVEFMT + sizeof RIFFCHKHDR
+			mov ax,4200h
+			int 21h
+			mov eax, dwSizeOrg
+			mov dwSize, eax
+			pop dx
+		.endif
+	.endw
+	inc dwChunks
+	mov eax, dwSize
+	ret
+error:
+	invoke printf, CStr("file read error [%x]",10), ax
+	stc
+	ret
+    
+fileread2 endp
 
 ;--- set DMA registers
 ;--- WRITEMASK      DMABase + 10 * DMAWidth
@@ -700,27 +755,34 @@ gettimer proc uses ds
 	ret
 gettimer endp
 
+	.const
+
+szHelp label byte
+	db "Play 8/16bit mono/stereo with cmd C6h/B6h (SB16 only).",10
+	db "Usage: ",PGMNAME," [options] .WAV-filename",10
+	db " options:",10
+	db " /q: don't display additional info.",10
+	db " /r: repeat playing.",10
+	db "Stop playing with <ESC>.",10
+	db 0
+
+	.code
+
+PFILEREAD typedef proto stdcall :word, :ptr, :dword
+
 main proc c argc:word, argv:ptr
 
 local hFile:word
 local dwSize:dword
 local dwTimer:dword
+local ReadProc:PFILEREAD
 local szVar[64]:byte
 
 	mov cs:[dsseg], ds
 	push ds
 	pop es
 	mov hFile, -1
-
-	.if argc < 2
-disphelp:
-		invoke printf, CStr("%s",10,"%s",10,"%s",10,"%s",10), 
-			CStr('Play 8/16bit mono/stereo with cmd C6h/B6h (SB16 only).'),
-			CStr("Usage: ",PGMNAME," [/q] .WAV-filename"),
-			CStr(" /q: don't display additional info."),
-			CStr('Stop playing with <ESC>.')
-		jmp exit2
-	.endif
+	mov ReadProc, offset fileread
 
 ;--- get BLASTER settings
 
@@ -729,30 +791,48 @@ disphelp:
 		invoke ScanBlasterVar, addr szVar
 	.endif
 
-	mov bx, argv
-	mov bx, [bx+1*2]
-	mov ax,[bx]
-	.if al == '/' || al == '-'
-		or ah,20h
-		.if ah == 'q' && argc > 2
-			mov bVerbose, 0
-			mov bx, argv
-			mov bx, [bx+2*2]
-			jmp optok
+	xor di, di
+	mov si, argv
+	add si, 2
+	.while word ptr [si]
+		mov bx, [si]
+		mov ax, [bx]
+		.if al == '/' || al == '-'
+			or ah,20h
+			.if ah == 'q'
+				mov bVerbose, 0
+			.elseif ah == 'r'
+				mov ReadProc, offset fileread2
+			.else
+				jmp disphelp
+			.endif
+		.else
+			.if !di
+				mov di, bx
+			.else
+				jmp disphelp
+			.endif
 		.endif
-		jmp disphelp
+		add si, 2
+	.endw
+
+	.if !di
+disphelp:
+		invoke printf, CStr("%s"), offset szHelp
+		jmp exit2
 	.endif
-optok:
 
 ;--- get file info
 
-	invoke getfileinfo, bx
+	invoke getfileinfo, di
 	jc exit2
 	mov hFile, bx
 	mov dwSize, eax
+	mov dwSizeOrg, eax
 
 	.if bVerbose
 		invoke printf, CStr("base=%X, irq=%u, dma=%u, hdma=%u",10), wBase, wIrq, wDmaL, wDmaH
+		invoke printf, CStr("data size=%lu",10), dwSize
 	.endif
 
 ;--- set linear address (dwSampleBuffer) and offset (pSampleBuffer) of sample buffer
@@ -766,12 +846,12 @@ optok:
 ;--- fill sample buffer
 
 	mov si, [pSampleBuffer]
-	invoke fileread, hFile, si, dwSize	; fill first half of buffer
+	invoke ReadProc, hFile, si, dwSize	; fill first half of buffer
 	jc exit
-	sub dwSize, eax
-	invoke fileread, hFile, si, dwSize	; fill second half of buffer
+	mov dwSize, eax
+	invoke ReadProc, hFile, si, dwSize	; fill second half of buffer
 	jc exit
-	sub dwSize, eax
+	mov dwSize, eax
 
 if USEVDS
 	smsw ax
@@ -868,26 +948,26 @@ endif
 	.endif
 
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 1st  MASK DMA CHANNEL
+;  MASK DMA CHANNEL
 ;
 	call GetDmaChannel
 	or al, DMA_MASK_DISABLE_CHN	; bit 2 sets mask, bits 0-1 select channel
 	mov dx, wDmaWriteMask
 	out dx, al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 2nd  CLEAR FLIPFLOP
+;  CLEAR FLIPFLOP
 ;
 	mov dx, wDmaClearFlipFlop
 	out dx, al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 3rd  WRITE TRANSFER MODE
+;  WRITE TRANSFER MODE
 ;
 	call GetDmaChannel
 	or al, WANTEDMODE
 	mov dx, wDmaWriteMode
 	out dx, al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 4th  WRITE PAGE NUMBER
+;  WRITE PAGE NUMBER
 ;
 if USEVDS
 	mov esi, [dds.dwPhys]
@@ -903,7 +983,7 @@ endif
 	mov dx, wDmaPageChn
 	out dx, al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 5th  WRITE BASEADDRESS
+;  WRITE BASEADDRESS
 ;
 	mov eax, esi
 	mov dx, wDmaBaseChn
@@ -915,7 +995,7 @@ endif
 	mov al, ah
 	out dx, al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 6th  WRITE SAMPLELENGTH-1
+;  WRITE SAMPLELENGTH-1
 ;
 	mov dx, wDmaCntChn
 	mov ecx, SAMPLEBUFFERLENGTH
@@ -929,7 +1009,7 @@ endif
 	mov al, ch
 	out dx, al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 7th  DEMASK CHANNEL
+;  DEMASK CHANNEL
 ;
 	call GetDmaChannel
 	or al, DMA_MASK_ENABLE_CHN	; this is actually zero
@@ -939,7 +1019,7 @@ endif
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
 ; Setup SoundBlaster :
 ;
-; 1st  SET SAMPLERATE
+;  SET SAMPLERATE
 ;
 	WriteDSP [wBase], DSP_SETOUTSAMPLERATE
 	mov ecx, wavefmt.nSamplesPerSec
@@ -950,17 +1030,23 @@ endif
 	mov al,cl
 	out dx,al
 ;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
-; 2nd  play 8/16bit stereo (B6 30)/mono (C6 00) XX XX
+;  play 8/16bit stereo (B6 ff)/mono (C6 ff) XX XX
 ;
 	WaitWrite
-	mov ax, 030B6h				;B6,30 = DMA DAC 16bit autoinit, stereo, signed
+	mov al, 0B6h				;B6 = DMA DAC 16bit autoinit
+	mov ah, 10h					;10 = signed
 	cmp wavefmt.wBitsPerSample, 16
 	jz @F
-	mov ax, 000C6h				;C6,00 = DMA DAC 8bit autoinit, mono, unsigned
+	mov al, 0C6h				;C6 = DMA DAC 8bit autoinit
+	mov ah, 00h					;00 = unsigned
 @@:
 	out dx, al
 	WaitWrite
-	mov al, ah					;AL = stereo signed / mono unsigned
+	mov al, ah
+	cmp wavefmt.nChannels, 1
+	jz @F
+	or al, 20h					;stereo (20h)
+@@:
 	out dx, al
 	call getsamplebufferlength
 	dec ecx
@@ -1000,9 +1086,9 @@ endif
 	mov [bReady],0
 	cmp dwSize, 0
 	jz done
-	invoke fileread, hFile, pSampleBuffer, dwSize
+	invoke ReadProc, hFile, pSampleBuffer, dwSize
 	jc exit
-	sub dwSize, eax
+	mov dwSize, eax
 if USEVDS
 	mov di, offset dds
 	mov dds.dwSize, SAMPLEBUFFERLENGTH shr 1
@@ -1024,7 +1110,7 @@ endif
 done:
 if 1
 ;--- wait till the last half has been played
-	invoke fileread, hFile, pSampleBuffer, dwSize
+	invoke ReadProc, hFile, pSampleBuffer, dwSize
 @@:
 	cmp [bReady],0
 	jz @B
